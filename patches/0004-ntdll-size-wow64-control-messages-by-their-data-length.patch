@@ -1,0 +1,55 @@
+From 135c7b478e06c9faabad8c275451be13a612f496 Mon Sep 17 00:00:00 2001
+From: Adam Franke <afranke@gmail.com>
+Date: Sun, 15 Nov 2026 00:16:07 -0500
+Subject: [PATCH] ntdll: Size wow64 control messages by their data length.
+
+wow64_translate_control() checked for room in the 32-bit control buffer
+using the whole 64-bit cmsg_len, which already includes the 16-byte
+64-bit header, as if it were the payload length. Each message therefore
+asked for 16 more bytes than WSA_CMSG_SPACE() gives it, and a 32-bit
+caller whose buffer is sized exactly got Control.len 0, MSG_CTRUNC and
+WSAEMSGSIZE. With only IP_PKTINFO enabled, which needs 20 bytes, any
+buffer under 36 bytes failed. The memcpy() also copied cmsg_len bytes
+of payload instead of the payload length, reading past the 64-bit
+message and writing into the reserved slack.
+
+Use the payload length for the space check, the 32-bit cmsg_len and the
+copy.
+
+This matters more now that macOS delivers the TOS and TTL control
+messages: a 32-bit application that sizes its buffer for IP_PKTINFO and
+IP_TOS (36 bytes) would otherwise fail every receive instead of
+receiving both.
+---
+ dlls/ntdll/unix/socket.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index 71b30a5..40244ae 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -556,17 +556,18 @@ static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_3
+     {
+         struct cmsghdr_32 *cmsg32 = (struct cmsghdr_32 *)ptr32;
+         const WSACMSGHDR *cmsg64 = (const WSACMSGHDR *)ptr64;
++        const size_t data_len = cmsg64->cmsg_len - sizeof(*cmsg64);
+ 
+-        if (ptr32 + sizeof(*cmsg32) + cmsg_align_32( cmsg64->cmsg_len ) > buf32 + max_len)
++        if (ptr32 + sizeof(*cmsg32) + cmsg_align_32( data_len ) > buf32 + max_len)
+         {
+             control32->len = 0;
+             return 0;
+         }
+ 
+-        cmsg32->cmsg_len = cmsg64->cmsg_len - sizeof(*cmsg64) + sizeof(*cmsg32);
++        cmsg32->cmsg_len = sizeof(*cmsg32) + data_len;
+         cmsg32->cmsg_level = cmsg64->cmsg_level;
+         cmsg32->cmsg_type = cmsg64->cmsg_type;
+-        memcpy( cmsg32 + 1, cmsg64 + 1, cmsg64->cmsg_len );
++        memcpy( cmsg32 + 1, cmsg64 + 1, data_len );
+ 
+         ptr64 += WSA_CMSG_ALIGN( cmsg64->cmsg_len );
+         ptr32 += cmsg_align_32( cmsg32->cmsg_len );
+-- 
+2.56.0
+
