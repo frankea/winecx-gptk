@@ -1,0 +1,70 @@
+From 9115192083b53562af8fc81213098b2619057b04 Mon Sep 17 00:00:00 2001
+From: Suresh Hemal <53757686+sureshhemal@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:06:45 -0500
+Subject: [PATCH] ntdll: Translate the received TOS and TTL control messages on
+ macOS.
+
+On macOS and the BSDs, a socket that enables IP_RECVTOS receives the TOS
+as a control message of type IP_RECVTOS (27 on macOS) with a one-byte
+payload, not as IP_TOS like on Linux. convert_control_headers() only
+matched IP_TOS, so the message fell through to the "Unhandled IPPROTO_IP
+message header type 27" FIXME and the application got no TOS data back.
+Steam's networking sockets library asks for TOS on its UDP sockets and
+asserts "No control data returned even though we asked for TOS?" on
+every Steam P2P/SDR connection attempt, writing a minidump each time.
+
+Also match IP_RECVTOS in the existing IP_TOS case, which already reads
+one byte and reports WS_IP_TOS.
+
+IP_RECVTTL has the same convention: the TTL arrives as type IP_RECVTTL
+(24 on macOS) with a one-byte payload, while the existing IP_TTL case
+copies four bytes, which suits Linux's int. Give IP_RECVTTL its own case
+that reads one byte and reports WS_IP_TTL as an INT.
+
+On Linux IP_RECVTOS and IP_RECVTTL are never used as control message
+types, so the new cases are never reached there.
+
+Reported and fixed in frankea/Whisky#326, where the TOS change was
+verified against Steam with a patched ntdll.so. The IP_RECVTTL case was
+added by Adam Franke following the reporter's note that TTL needs the
+same treatment.
+---
+ dlls/ntdll/unix/socket.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index 9674d0f..71b30a5 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -432,6 +432,9 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
+ 
+ #if defined(IP_TOS)
+                     case IP_TOS:
++#if defined(IP_RECVTOS) && IP_RECVTOS != IP_TOS
++                    case IP_RECVTOS: /* macOS and the BSDs report the received TOS with this type */
++#endif
+                     {
+                         INT tos = *(unsigned char *)CMSG_DATA(cmsg_unix);
+                         ptr = fill_control_message( WS_IPPROTO_IP, WS_IP_TOS, ptr, &ctlsize,
+@@ -451,6 +454,18 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
+                     }
+ #endif /* IP_TTL */
+ 
++#if defined(IP_RECVTTL) && (!defined(IP_TTL) || IP_RECVTTL != IP_TTL)
++                    case IP_RECVTTL:
++                    {
++                        /* macOS and the BSDs report the received TTL with this type, as a single byte */
++                        INT ttl = *(unsigned char *)CMSG_DATA(cmsg_unix);
++                        ptr = fill_control_message( WS_IPPROTO_IP, WS_IP_TTL, ptr, &ctlsize,
++                                                    &ttl, sizeof(INT) );
++                        if (!ptr) goto error;
++                        break;
++                    }
++#endif /* IP_RECVTTL */
++
+                     default:
+                         FIXME("Unhandled IPPROTO_IP message header type %d\n", cmsg_unix->cmsg_type);
+                         break;
+-- 
+2.56.0
+
