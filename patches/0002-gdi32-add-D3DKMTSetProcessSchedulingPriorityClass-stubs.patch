@@ -1,0 +1,117 @@
+From 97307ab70b449a4ae4e5313ce8f570880fad6631 Mon Sep 17 00:00:00 2001
+From: Adam Franke <afranke@gmail.com>
+Date: Fri, 20 Nov 2026 21:04:31 -0500
+Subject: [PATCH] gdi32: Add D3DKMTSetProcessSchedulingPriorityClass and
+ D3DKMTGetProcessSchedulingPriorityClass stubs.
+
+The 32-bit SteamService.exe imports D3DKMTSetProcessSchedulingPriorityClass
+from gdi32. When a game exits, steam.exe asks the service to reset the GPU
+scheduling priority of its steamwebhelper processes; the service calls the
+missing export, hits the import stub and crashes. steam.exe then waits on a
+reply that never arrives, its main loop stalls, and the game stays listed as
+running.
+
+Report success for valid priority classes and return NORMAL from the getter.
+Wine has no GPU scheduler to forward the class to.
+---
+ dlls/gdi32/gdi32.spec  |  2 ++
+ dlls/gdi32/objects.c   | 25 +++++++++++++++++++++++++
+ include/ddk/d3dkmthk.h | 12 ++++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/dlls/gdi32/gdi32.spec b/dlls/gdi32/gdi32.spec
+index 207549f..70e502c 100644
+--- a/dlls/gdi32/gdi32.spec
++++ b/dlls/gdi32/gdi32.spec
+@@ -121,6 +121,7 @@
+ @ stdcall D3DKMTEnumAdapters(ptr) win32u.NtGdiDdDDIEnumAdapters
+ @ stdcall D3DKMTEnumAdapters2(ptr) win32u.NtGdiDdDDIEnumAdapters2
+ @ stdcall D3DKMTEscape(ptr) win32u.NtGdiDdDDIEscape
++@ stdcall D3DKMTGetProcessSchedulingPriorityClass(ptr ptr)
+ @ stdcall D3DKMTOpenAdapterFromDeviceName(ptr) win32u.NtGdiDdDDIOpenAdapterFromDeviceName
+ @ stdcall D3DKMTOpenAdapterFromGdiDisplayName(ptr)
+ @ stdcall D3DKMTOpenAdapterFromHdc(ptr) win32u.NtGdiDdDDIOpenAdapterFromHdc
+@@ -143,6 +144,7 @@
+ @ stdcall D3DKMTQueryVideoMemoryInfo(ptr) win32u.NtGdiDdDDIQueryVideoMemoryInfo
+ @ stdcall D3DKMTReleaseKeyedMutex(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex
+ @ stdcall D3DKMTReleaseKeyedMutex2(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex2
++@ stdcall D3DKMTSetProcessSchedulingPriorityClass(ptr long)
+ @ stdcall D3DKMTSetQueuedLimit(ptr) win32u.NtGdiDdDDISetQueuedLimit
+ @ stdcall D3DKMTSetVidPnSourceOwner(ptr) win32u.NtGdiDdDDISetVidPnSourceOwner
+ @ stdcall D3DKMTShareObjects(long ptr ptr long ptr) win32u.NtGdiDdDDIShareObjects
+diff --git a/dlls/gdi32/objects.c b/dlls/gdi32/objects.c
+index f2b353c..96712de 100644
+--- a/dlls/gdi32/objects.c
++++ b/dlls/gdi32/objects.c
+@@ -896,6 +896,31 @@ NTSTATUS WINAPI D3DKMTOpenAdapterFromGdiDisplayName( D3DKMT_OPENADAPTERFROMGDIDI
+     return NtUserD3DKMTOpenAdapterFromGdiDisplayName( desc );
+ }
+ 
++/***********************************************************************
++ *           D3DKMTSetProcessSchedulingPriorityClass    (GDI32.@)
++ */
++NTSTATUS WINAPI D3DKMTSetProcessSchedulingPriorityClass( HANDLE process,
++                                                         D3DKMT_SCHEDULINGPRIORITYCLASS priority )
++{
++    FIXME( "(%p, %d): stub\n", process, priority );
++
++    if ((UINT)priority > D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME) return STATUS_INVALID_PARAMETER;
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           D3DKMTGetProcessSchedulingPriorityClass    (GDI32.@)
++ */
++NTSTATUS WINAPI D3DKMTGetProcessSchedulingPriorityClass( HANDLE process,
++                                                         D3DKMT_SCHEDULINGPRIORITYCLASS *priority )
++{
++    FIXME( "(%p, %p): stub\n", process, priority );
++
++    if (!priority) return STATUS_INVALID_PARAMETER;
++    *priority = D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL;
++    return STATUS_SUCCESS;
++}
++
+ /***********************************************************************
+  *           SetObjectOwner    (GDI32.@)
+  */
+diff --git a/include/ddk/d3dkmthk.h b/include/ddk/d3dkmthk.h
+index 442379b..bfe8a15 100644
+--- a/include/ddk/d3dkmthk.h
++++ b/include/ddk/d3dkmthk.h
+@@ -803,6 +803,16 @@ typedef struct _D3DKMT_SETQUEUEDLIMIT
+     } DUMMYUNIONNAME;
+ } D3DKMT_SETQUEUEDLIMIT;
+ 
++typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
++{
++    D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME
++} D3DKMT_SCHEDULINGPRIORITYCLASS;
++
+ typedef enum _D3DKMT_ESCAPETYPE
+ {
+     D3DKMT_ESCAPE_DRIVERPRIVATE,
+@@ -1292,6 +1302,7 @@ NTSTATUS WINAPI D3DKMTDestroyKeyedMutex( const D3DKMT_DESTROYKEYEDMUTEX *params
+ NTSTATUS WINAPI D3DKMTDestroySynchronizationObject( const D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *params );
+ NTSTATUS WINAPI D3DKMTEnumAdapters2(D3DKMT_ENUMADAPTERS2 *desc);
+ NTSTATUS WINAPI D3DKMTEscape( const D3DKMT_ESCAPE *desc );
++NTSTATUS WINAPI D3DKMTGetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS *priority );
+ NTSTATUS WINAPI D3DKMTOpenAdapterFromDeviceName( D3DKMT_OPENADAPTERFROMDEVICENAME *desc );
+ NTSTATUS WINAPI D3DKMTOpenAdapterFromGdiDisplayName(D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME *desc);
+ NTSTATUS WINAPI D3DKMTOpenAdapterFromHdc( D3DKMT_OPENADAPTERFROMHDC *desc );
+@@ -1314,6 +1325,7 @@ NTSTATUS WINAPI D3DKMTQueryStatistics(D3DKMT_QUERYSTATISTICS *stats);
+ NTSTATUS WINAPI D3DKMTQueryVideoMemoryInfo(D3DKMT_QUERYVIDEOMEMORYINFO *desc);
+ NTSTATUS WINAPI D3DKMTReleaseKeyedMutex( D3DKMT_RELEASEKEYEDMUTEX *params );
+ NTSTATUS WINAPI D3DKMTReleaseKeyedMutex2( D3DKMT_RELEASEKEYEDMUTEX2 *params );
++NTSTATUS WINAPI D3DKMTSetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS priority );
+ NTSTATUS WINAPI D3DKMTSetQueuedLimit(D3DKMT_SETQUEUEDLIMIT *desc);
+ NTSTATUS WINAPI D3DKMTSetVidPnSourceOwner(const D3DKMT_SETVIDPNSOURCEOWNER *desc);
+ NTSTATUS WINAPI D3DKMTShareObjects( UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr, UINT access, HANDLE *handle );
+-- 
+2.56.0
+
