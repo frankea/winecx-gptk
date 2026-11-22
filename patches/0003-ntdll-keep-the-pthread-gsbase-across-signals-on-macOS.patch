@@ -1,0 +1,129 @@
+From 647f6e916b3fb9eaccae0b1398640c74a780de4c Mon Sep 17 00:00:00 2001
+From: Tarushv Kosgi <47307733+tarushvkodes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 20:14:27 -0500
+Subject: [PATCH] ntdll: Keep the pthread gsbase across signals on macOS.
+
+On macOS, PE code normally runs with gsbase on the pthread TSD, with a few
+TEB fields mirrored into it. D3DMetal relies on that: it calls its Mach-O
+code straight from PE code, on the PE stack and outside any Wine syscall.
+leave_handler() nevertheless sets gsbase to the TEB whenever a signal
+returns to code that is not inside a syscall.
+
+GPTK 4.0 beta 3 parks a Win32 thread ("D3DMetalWineThread") in
+os_sync_wait_on_address(). When a signal wakes it, the wait returns EINTR
+and libsystem stores errno through __error(), which reads gs:0x8. With the
+TEB in gsbase that is Tib.StackBase, the first byte past the thread's
+stack, so the store faults. GTA V Enhanced dies this way about ten seconds
+after it starts: 0xc0000005 at os_sync_wait_on_address+0x6b, a write to
+StackBase, on a thread started from Apple's dxgi.dll.
+
+Record, per handler invocation, whether the interrupted code ran on the
+pthread gsbase outside a syscall, and hand such a thread back that gsbase
+and what it had under gs:0x20 (init_handler() puts the macOS QoS value
+there for fiber threads). A context that arrived on the TEB keeps the old
+behaviour, and check_invalid_gsbase() still gets the TEB installed.
+
+The record lives in the spare cpu_data slots of the TEB. uc_link cannot
+carry it: Rosetta asserts that it is NULL at sigreturn.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/signal_x86_64.c | 54 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index cbc3488..33dd5e3 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -522,6 +522,8 @@ struct amd64_thread_data
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     char                  syscall_dispatch; /* 0340 */
+     void                 *pthread_qos;   /* 0348 macOS: unix-side value of the TSD slot under gs:0x20 */
++    void                 *pthread_gs_ctx[2];   /* 0350 macOS: signal contexts that interrupted code on the pthread gsbase */
++    void                 *pthread_gs_slot4[2]; /* 0360 macOS: what that code had under gs:0x20 */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
+@@ -544,6 +546,19 @@ static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
+ static UINT64 xstate_extended_features;
+ static LONG syscall_dispatch_enabled = TRUE;
+ 
++#ifdef __APPLE__
++/* Index of sigcontext among the contexts recorded as having interrupted code on the pthread gsbase
++ * (of a free slot for NULL), or -1. */
++static inline int find_pthread_gs_context( const struct amd64_thread_data *amd64_data, const void *sigcontext )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(amd64_data->pthread_gs_ctx); i++)
++        if (amd64_data->pthread_gs_ctx[i] == sigcontext) return i;
++    return -1;
++}
++#endif
++
+ static inline struct thread_data *get_current_thread_data(void)
+ {
+     unsigned long rsp;
+@@ -799,6 +814,24 @@ static inline struct thread_data *init_handler( void *sigcontext )
+     amd64_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
+     if (fs32_sel) arch_prctl( ARCH_SET_FS, amd64_data->pthread_teb );
+ #elif defined __APPLE__
++    {
++        void **tsd = amd64_data->pthread_teb;
++        void *gs0;
++        int i;
++
++        /* slot 0 of the pthread TSD holds pthread_self(); on the TEB it is Tib.ExceptionList */
++        __asm__ volatile( "movq %%gs:0,%0" : "=r" (gs0) );
++        /* a handler that returned without leave_handler() leaves its context behind */
++        if ((i = find_pthread_gs_context( amd64_data, sigcontext )) >= 0) amd64_data->pthread_gs_ctx[i] = NULL;
++        if (tsd && gs0 == tsd[0] &&
++            !is_inside_signal_stack( data, (void *)RSP_sig((ucontext_t *)sigcontext) ) &&
++            !is_inside_syscall( data, RSP_sig((ucontext_t *)sigcontext) ) &&
++            (i = find_pthread_gs_context( amd64_data, NULL )) >= 0)
++        {
++            amd64_data->pthread_gs_ctx[i] = sigcontext;
++            amd64_data->pthread_gs_slot4[i] = tsd[4];
++        }
++    }
+     _thread_set_tsd_base( (uint64_t)amd64_data->pthread_teb );
+ 
+     /* PE code runs with gsbase on the pthread TSD, where gs:0x20 is both the
+@@ -842,7 +875,21 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
+ #elif defined __APPLE__
+     if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( data, RSP_sig(sigcontext )))
+-        _thread_set_tsd_base( (uint64_t)data->teb );
++    {
++        int i = find_pthread_gs_context( amd64_data, sigcontext );
++
++        /* PE code normally runs on the pthread gsbase here, with a few TEB fields mirrored into it, and
++         * D3DMetal calls its Mach-O code straight from PE code: on the PE stack and outside any syscall.
++         * Hand such a thread back the gsbase it arrived with, and what it had under gs:0x20. Forcing the
++         * TEB made the interrupted Mach-O code read TEB fields as pthread TSD slots: a D3DMetal worker
++         * thread woken by a signal stored errno through Tib.StackBase. */
++        if (i >= 0) ((void **)amd64_data->pthread_teb)[4] = amd64_data->pthread_gs_slot4[i];
++        else _thread_set_tsd_base( (uint64_t)data->teb );
++    }
++    {
++        int i = find_pthread_gs_context( amd64_data, sigcontext );
++        if (i >= 0) amd64_data->pthread_gs_ctx[i] = NULL;
++    }
+ #endif
+     if (is_16bit( sigcontext )) return;
+ #ifdef DS_sig
+@@ -2402,6 +2449,11 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
+     sysarch( X86_64_SET_GSBASE, &data->teb );
+ #elif defined(__APPLE__)
+     /* leave_handler() will set GSBASE to the TEB */
++    {
++        struct amd64_thread_data *amd64_data = amd64_thread_data( data );
++        int i = find_pthread_gs_context( amd64_data, ucontext );
++        if (i >= 0) amd64_data->pthread_gs_ctx[i] = NULL;
++    }
+ #endif
+     return TRUE;
+ }
+-- 
+2.54.0 (Apple Git-157)
+
