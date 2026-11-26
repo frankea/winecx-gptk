@@ -110,6 +110,17 @@ jobs:
           # the patch number is the commit count, and a depth-1 checkout counts 1
           fetch-depth: 0
 
+      - name: a pinned version is a release, and releases are -O3
+        if: github.event_name == 'workflow_dispatch' && inputs.runtime_version != '' && inputs.opt != 'release'
+        run: |
+          # pinning runtime_version is how a build gets cut for Whisky to ship.
+          # v4.8.5 was dispatched that way at the default opt, so every dll
+          # came out -O2 against a v4.8.3 built -O3: not v4.8.3 plus three
+          # patches but a different build of the whole tree, and it broke
+          # games that ran on v4.8.3. stop here rather than two hours later
+          echo "::error::runtime_version is set, so this is a release build; dispatch it with opt=release"
+          exit 1
+
       - name: ensure rosetta
         run: |
           /usr/sbin/softwareupdate --install-rosetta --agree-to-license || true
@@ -407,6 +418,9 @@ jobs:
               ;;
           esac
           echo "optimisation: $OPT" | tee -a "$GITHUB_STEP_SUMMARY"
+          # stamped into WhiskyWineVersion.plist, so the level a tarball was
+          # built at can be read off the tarball and not only off a build log
+          echo "BUILD_OPT=$OPT" >> "$GITHUB_ENV"
           # -Werror=unguarded-availability-new is the floor's enforcement: the
           # builder's SDK is newer than MACOSX_DEPLOYMENT_TARGET, and clang's
           # answer to an API above the target is a weak link, so the call is a
@@ -961,6 +975,8 @@ jobs:
             <string>DXVK_VER</string>
             <key>dxmtVersion</key>
             <string>DXMT_VER</string>
+            <key>buildOptimization</key>
+            <string>BUILD_OPT_VALUE</string>
             <key>version</key>
             <dict>
               <key>major</key>
@@ -984,10 +1000,11 @@ jobs:
             [0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::runtime_version '$rv' is not major.minor.patch"; exit 1;;
           esac
-          sed -i '' "s/DXVK_VER/$DXVK_VERSION/; s/DXMT_VER/$DXMT_VERSION/" Libraries/WhiskyWineVersion.plist
+          sed -i '' "s/DXVK_VER/$DXVK_VERSION/; s/DXMT_VER/$DXMT_VERSION/; s/BUILD_OPT_VALUE/$BUILD_OPT/" \
+            Libraries/WhiskyWineVersion.plist
           sed -i '' "s/VER_MAJOR/${rv%%.*}/; s/VER_MINOR/$(echo "$rv" | cut -d. -f2)/; s/VER_PATCH/${rv##*.}/" \
             Libraries/WhiskyWineVersion.plist
-          grep -q VER_ Libraries/WhiskyWineVersion.plist && { echo "::error::version not substituted"; exit 1; }
+          grep -qE 'VER_|BUILD_OPT_VALUE' Libraries/WhiskyWineVersion.plist && { echo "::error::plist not fully substituted"; exit 1; }
           echo "runtime version stamped: $rv"
           # later steps name the release after it; recomputing the commit count
           # there would drift the moment someone passes runtime_version
