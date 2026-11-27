@@ -338,7 +338,11 @@ static void watch_resource(void *res, UINT w, UINT h, UINT fmt)
 
 /* ---- device ---- */
 
-#define DEV_SLOTS 64
+/* room for the newest device interface the headers know. a fixed 64 stopped
+ * at ID3D12Device6, so every ID3D12Device7+ method of the wrapped device read
+ * past the copy and came back NULL: The Witcher 3 5.02 calls AddToStateObject
+ * (slot 66) at startup and jumped to 0 (frankea/Whisky#426) */
+#define DEV_SLOTS (sizeof(ID3D12Device10Vtbl) / sizeof(void *))
 static void *dev_vtbl[DEV_SLOTS];
 static void **dev_orig;
 
@@ -2011,10 +2015,43 @@ static void wrap_command_list(void *list)
         *obj = (void **)list_vtbl;
 }
 
+/* how many slots the real device's vtable has, going by the newest device
+ * interface it answers to. copying only that many keeps the copy from reading
+ * past the end of a shorter vtable */
+static unsigned int device_slots(void *dev)
+{
+    static const struct { const IID *iid; unsigned int slots; } ifaces[] =
+    {
+        { &IID_ID3D12Device10, sizeof(ID3D12Device10Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device9, sizeof(ID3D12Device9Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device8, sizeof(ID3D12Device8Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device7, sizeof(ID3D12Device7Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device6, sizeof(ID3D12Device6Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device5, sizeof(ID3D12Device5Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device4, sizeof(ID3D12Device4Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device3, sizeof(ID3D12Device3Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device2, sizeof(ID3D12Device2Vtbl) / sizeof(void *) },
+        { &IID_ID3D12Device1, sizeof(ID3D12Device1Vtbl) / sizeof(void *) },
+    };
+    pfn_qi qi = (pfn_qi)(*(void ***)dev)[0];
+    unsigned int i;
+    void *iface;
+
+    for (i = 0; i < sizeof(ifaces) / sizeof(ifaces[0]); i++)
+    {
+        if (SUCCEEDED(qi(dev, ifaces[i].iid, &iface)))
+        {
+            IUnknown_Release((IUnknown *)iface);
+            return ifaces[i].slots;
+        }
+    }
+    return sizeof(ID3D12DeviceVtbl) / sizeof(void *);
+}
+
 static void wrap_device(void *dev)
 {
     void ***obj = dev;
-    unsigned int i;
+    unsigned int i, n;
 
     if (*obj == (void **)dev_vtbl)
         return;
@@ -2027,7 +2064,8 @@ static void wrap_device(void *dev)
     init_video_vtables();
 
     dev_orig = *obj;
-    for (i = 0; i < DEV_SLOTS; i++)
+    n = device_slots(dev);
+    for (i = 0; i < n; i++)
         dev_vtbl[i] = dev_orig[i];
     dev_vtbl[0] = (void *)shim_QueryInterface;
     dev_vtbl[SLOT(ID3D12DeviceVtbl, CreateCommandQueue)] = (void *)shim_CreateCommandQueue;
@@ -2039,7 +2077,7 @@ static void wrap_device(void *dev)
     dev_vtbl[29] = (void *)shim_CreatePlacedResource;
     dev_vtbl[38] = (void *)shim_GetCopyableFootprints;
     *obj = (void **)dev_vtbl;
-    LOG("device %p wrapped\n", dev);
+    LOG("device %p wrapped, %u of %u slots\n", dev, n, (unsigned int)DEV_SLOTS);
 }
 
 /* ---- exports ---- */
